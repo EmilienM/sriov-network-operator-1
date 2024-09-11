@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -21,15 +23,14 @@ import (
 )
 
 const (
-	ospHostMetaDataDir     = "/host/var/config/openstack/2018-08-27"
-	ospMetaDataDir         = "/var/config/openstack/2018-08-27"
-	ospMetaDataBaseURL     = "http://169.254.169.254/openstack/2018-08-27"
-	ospNetworkDataJSON     = "network_data.json"
-	ospMetaDataJSON        = "meta_data.json"
-	ospHostNetworkDataFile = ospHostMetaDataDir + "/" + ospNetworkDataJSON
-	ospHostMetaDataFile    = ospHostMetaDataDir + "/" + ospMetaDataJSON
-	ospNetworkDataURL      = ospMetaDataBaseURL + "/" + ospNetworkDataJSON
-	ospMetaDataURL         = ospMetaDataBaseURL + "/" + ospMetaDataJSON
+	varConfigPath      = "/var/config"
+	ospMetaDataBaseDir = "/openstack/2018-08-27"
+	ospMetaDataDir     = varConfigPath + ospMetaDataBaseDir
+	ospMetaDataBaseURL = "http://169.254.169.254" + ospMetaDataBaseDir
+	ospNetworkDataJSON = "network_data.json"
+	ospMetaDataJSON    = "meta_data.json"
+	ospNetworkDataURL  = ospMetaDataBaseURL + "/" + ospNetworkDataJSON
+	ospMetaDataURL     = ospMetaDataBaseURL + "/" + ospMetaDataJSON
 )
 
 var (
@@ -109,8 +110,8 @@ func New(hostManager host.HostManagerInterface) OpenstackInterface {
 }
 
 // GetOpenstackData gets the metadata and network_data
-func getOpenstackData(useHostPath bool) (metaData *OSPMetaData, networkData *OSPNetworkData, err error) {
-	metaData, networkData, err = getOpenstackDataFromConfigDrive(useHostPath)
+func getOpenstackData(mountConfigDrive bool) (metaData *OSPMetaData, networkData *OSPNetworkData, err error) {
+	metaData, networkData, err = getOpenstackDataFromConfigDrive(mountConfigDrive)
 	if err != nil {
 		metaData, networkData, err = getOpenstackDataFromMetadataService()
 		if err != nil {
@@ -153,46 +154,102 @@ func getOpenstackData(useHostPath bool) (metaData *OSPMetaData, networkData *OSP
 	return metaData, networkData, err
 }
 
+// fileExists checks if a file exists and returns a boolean
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return (err == nil)
+}
+
+// getConfigDriveLabel returns the config drive label that was found
+// either "config-2" or "CONFIG-2" or empty string if not found
+func getConfigDriveLabel() string {
+	var configDriveLabel string
+	if fileExists("/dev/disk/by-label/config-2") {
+		configDriveLabel = "config-2"
+	} else if fileExists("/dev/disk/by-label/CONFIG-2") {
+		configDriveLabel = "CONFIG-2"
+	}
+	return configDriveLabel
+}
+
+// mountConfigDriveByLabel mounts the config drive by label and return its path
+func mountConfigDriveByLabel(configDriveLabel string) (string, error) {
+	tmpDir, err := os.MkdirTemp("", "sriov-configdrive")
+	if err != nil {
+		return "", fmt.Errorf("error creating temp directory: %w", err)
+	}
+	configDrivePath := "/dev/disk/by-label/" + configDriveLabel
+	cmd := exec.Command("mount", "-o", "ro", "-t", "auto", configDrivePath, tmpDir)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("error mounting config drive: %w", err)
+	}
+	return tmpDir, nil
+}
+
+// ummountConfigDriveByLabel ummounts the config drive by label
+func ummountConfigDriveByLabel(configDrivePath string) error {
+	cmd := exec.Command("umount", configDrivePath)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("error umounting config drive: %w", err)
+	}
+	return nil
+}
+
 // getOpenstackDataFromConfigDrive reads the meta_data and network_data files
-func getOpenstackDataFromConfigDrive(useHostPath bool) (metaData *OSPMetaData, networkData *OSPNetworkData, err error) {
+func getOpenstackDataFromConfigDrive(mountConfigDrive bool) (metaData *OSPMetaData, networkData *OSPNetworkData, err error) {
 	metaData = &OSPMetaData{}
 	networkData = &OSPNetworkData{}
+	var configDrivePath string
 	log.Log.Info("reading OpenStack meta_data from config-drive")
 	var metadataf *os.File
 	ospMetaDataFilePath := ospMetaDataFile
-	if useHostPath {
-		ospMetaDataFilePath = ospHostMetaDataFile
+	if mountConfigDrive {
+		configDriveLabel := getConfigDriveLabel()
+		if ospMetaDataFilePath == "" {
+			return metaData, networkData, fmt.Errorf("error finding config drive device")
+		}
+		configDrivePath, err = mountConfigDriveByLabel(configDriveLabel)
+		if err != nil {
+			return metaData, networkData, fmt.Errorf("error mounting config drive with label %s: %w", configDriveLabel, err)
+		}
+		defer func() {
+			if e := ummountConfigDriveByLabel(configDrivePath); err == nil && e != nil {
+				err = fmt.Errorf("error umounting config drive with label %s: %w", configDriveLabel, e)
+			}
+			if e := os.Remove(configDrivePath); err == nil && e != nil {
+				err = fmt.Errorf("error removing temp directory %s: %w", configDrivePath, e)
+			}
+		}()
+		ospMetaDataFilePath = filepath.Join(configDrivePath, ospMetaDataBaseDir, ospMetaDataJSON)
+		ospNetworkDataFile = filepath.Join(configDrivePath, ospMetaDataBaseDir, ospNetworkDataJSON)
 	}
 	metadataf, err = os.Open(ospMetaDataFilePath)
 	if err != nil {
-		return metaData, networkData, fmt.Errorf("error opening file %s: %w", ospHostMetaDataFile, err)
+		return metaData, networkData, fmt.Errorf("error opening file %s: %w", ospMetaDataFilePath, err)
 	}
 	defer func() {
 		if e := metadataf.Close(); err == nil && e != nil {
-			err = fmt.Errorf("error closing file %s: %w", ospHostMetaDataFile, e)
+			err = fmt.Errorf("error closing file %s: %w", ospMetaDataFilePath, e)
 		}
 	}()
 	if err = json.NewDecoder(metadataf).Decode(&metaData); err != nil {
-		return metaData, networkData, fmt.Errorf("error unmarshalling metadata from file %s: %w", ospHostMetaDataFile, err)
+		return metaData, networkData, fmt.Errorf("error unmarshalling metadata from file %s: %w", ospMetaDataFilePath, err)
 	}
 
 	log.Log.Info("reading OpenStack network_data from config-drive")
 	var networkDataf *os.File
 	ospNetworkDataFilePath := ospNetworkDataFile
-	if useHostPath {
-		ospNetworkDataFilePath = ospHostNetworkDataFile
-	}
 	networkDataf, err = os.Open(ospNetworkDataFilePath)
 	if err != nil {
-		return metaData, networkData, fmt.Errorf("error opening file %s: %w", ospHostNetworkDataFile, err)
+		return metaData, networkData, fmt.Errorf("error opening file %s: %w", ospNetworkDataFilePath, err)
 	}
 	defer func() {
 		if e := networkDataf.Close(); err == nil && e != nil {
-			err = fmt.Errorf("error closing file %s: %w", ospHostNetworkDataFile, e)
+			err = fmt.Errorf("error closing file %s: %w", ospNetworkDataFilePath, e)
 		}
 	}()
 	if err = json.NewDecoder(networkDataf).Decode(&networkData); err != nil {
-		return metaData, networkData, fmt.Errorf("error unmarshalling metadata from file %s: %w", ospHostNetworkDataFile, err)
+		return metaData, networkData, fmt.Errorf("error unmarshalling metadata from file %s: %w", ospNetworkDataFilePath, err)
 	}
 	return metaData, networkData, err
 }
